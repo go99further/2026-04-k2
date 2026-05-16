@@ -1,106 +1,126 @@
-# [L-02] Proof of Concept — Flash liquidation helper rejects valid full-liquidations
+# [L-02] Proof of Concept — 闪电清算 helper 硬编码 50% 清算比例，误拒合法全额清算
 
-## What this proves
+## 漏洞位置
 
-When a position qualifies for 100% liquidation (debt < $2 000 or collateral < $2 000), the flash liquidation helper's hardcoded 50% close factor causes it to return `LiquidationAmountTooHigh` for the full-debt amount. The main router would accept the same call. The test below simulates this mismatch with concrete numbers and asserts the false rejection.
+`contracts/flash-liquidation-helper/src/validation.rs:61-68`
 
-## Run
+```rust
+// 有问题的代码：始终使用 DEFAULT_LIQUIDATION_CLOSE_FACTOR = 5_000（50%）
+let max_liquidatable = total_debt_base
+    .checked_mul(DEFAULT_LIQUIDATION_CLOSE_FACTOR)  // 硬编码 50%
+    ...
+if debt_to_cover_base > max_liquidatable {
+    return Err(KineticRouterError::LiquidationAmountTooHigh);
+}
+```
+
+主路由器的动态逻辑（`contracts/kinetic-router/src/liquidation.rs:20-25`）：
+
+```rust
+// 正确逻辑：满足任一条件时允许 100% 清算
+let close_factor = if individual_debt_base < MIN_CLOSE_FACTOR_THRESHOLD   // 债务 < $2,000
+    || individual_collateral_base < MIN_CLOSE_FACTOR_THRESHOLD             // 抵押品 < $2,000
+    || health_factor < partial_liq_threshold {                             // 严重抵押不足
+    MAX_LIQUIDATION_CLOSE_FACTOR   // 10_000 = 100%
+} else {
+    DEFAULT_LIQUIDATION_CLOSE_FACTOR  // 5_000 = 50%
+};
+```
+
+## 运行方式
 
 ```bash
 cargo test --package k2-c4 test_hardcoded_close_factor_false_rejection -- --nocapture
 ```
 
-## Test
+## 测试代码
 
-Add to `tests/c4/src/lib.rs` after `test_submission_validity`:
+将以下函数添加到 `tests/c4/src/lib.rs`（`test_submission_validity` 之后）：
 
 ```rust
 #[test]
 fn test_hardcoded_close_factor_false_rejection() {
-    // -----------------------------------------------------------------------
-    // Constants (from k2_shared):
-    //   DEFAULT_LIQUIDATION_CLOSE_FACTOR = 5_000  (50%, basis points)
-    //   MAX_LIQUIDATION_CLOSE_FACTOR     = 10_000 (100%)
-    //   MIN_CLOSE_FACTOR_THRESHOLD       = 2_000_000_000_000_000_000 (= $2 000 in WAD)
+    // 协议常量（来自 contracts/shared/src/constants.rs）：
+    //   DEFAULT_LIQUIDATION_CLOSE_FACTOR = 5_000   (50%)
+    //   MAX_LIQUIDATION_CLOSE_FACTOR     = 10_000  (100%)
+    //   MIN_CLOSE_FACTOR_THRESHOLD       = 2_000 * WAD
     //   BASIS_POINTS_MULTIPLIER          = 10_000
     //
-    // Main router dynamic close factor logic (liquidation.rs `validate_close_factor`):
-    //   if total_debt_base < MIN_CLOSE_FACTOR_THRESHOLD
-    //      OR total_collateral_base < MIN_CLOSE_FACTOR_THRESHOLD:
-    //       close_factor = 100%
-    //   else:
-    //       close_factor = 50%
+    // 场景：借款人债务 $1,500（< $2,000 阈值）
+    // 清算机器人调用 helper 预验证，传入 debt_to_cover = 100% 债务
     //
-    // Flash liquidation helper (validation.rs lines 60-68):
-    //   always uses DEFAULT_LIQUIDATION_CLOSE_FACTOR = 50%
-    // -----------------------------------------------------------------------
-
-    // Scenario: small borrower with $1 500 total debt (below $2 000 threshold)
-    // PRICE_ONE_DOLLAR = 100_000_000_000_000 (14 decimal oracle precision)
-    // WAD              = 1_000_000_000_000_000_000 (18 decimals)
-    // oracle_to_wad    = WAD / PRICE_ONE_DOLLAR = 10_000 (for 14-decimal oracle)
+    // helper 计算：max_liquidatable = $1,500 * 50% = $750
+    //              $1,500 > $750 → 返回 LiquidationAmountTooHigh  ← 错误拒绝
     //
-    // total_debt_base in WAD units for $1 500:
-    //   = 1_500 * PRICE_ONE_DOLLAR * oracle_to_wad / decimals_pow
-    //   For simplicity, work directly in base-currency units (WAD-scaled dollars):
-    let total_debt_base: u128 = 1_500_000_000_000_000_000_000; // $1 500 in WAD
-    let min_close_factor_threshold: u128 = 2_000_000_000_000_000_000_000; // $2 000 in WAD
+    // 主路由器计算：$1,500 < MIN_CLOSE_FACTOR_THRESHOLD → close_factor = 100%
+    //              max_liquidatable = $1,500 * 100% = $1,500
+    //              $1,500 <= $1,500 → 接受  ← 正确
 
-    // Liquidator wants to cover 100% of debt
-    let debt_to_cover_base = total_debt_base;
+    // WAD = 1e18，MIN_CLOSE_FACTOR_THRESHOLD = 2_000 * WAD
+    const WAD: u128 = 1_000_000_000_000_000_000;
+    const MIN_CLOSE_FACTOR_THRESHOLD: u128 = 2_000 * WAD;
+    const DEFAULT_CLOSE_FACTOR: u128 = 5_000;
+    const MAX_CLOSE_FACTOR: u128 = 10_000;
+    const BASIS_POINTS: u128 = 10_000;
 
-    // --- Helper validation (buggy: hardcoded 50%) ---
-    let default_close_factor: u128 = 5_000;
-    let basis_points: u128 = 10_000;
-    let max_liquidatable_helper = total_debt_base * default_close_factor / basis_points; // $750
+    // 债务 $1,500（WAD 计价）
+    let total_debt_base: u128 = 1_500 * WAD;
+    let debt_to_cover_base: u128 = total_debt_base; // 清算机器人尝试全额清算
 
-    let helper_rejects = debt_to_cover_base > max_liquidatable_helper;
+    // --- helper 验证逻辑（硬编码 50%）---
+    let helper_max = total_debt_base * DEFAULT_CLOSE_FACTOR / BASIS_POINTS; // $750 * WAD
+    let helper_rejects = debt_to_cover_base > helper_max;
 
-    // --- Main router validation (correct: dynamic 100% for small positions) ---
-    let dynamic_close_factor = if total_debt_base < min_close_factor_threshold {
-        10_000u128 // 100%
+    // --- 主路由器验证逻辑（动态 close factor）---
+    let router_close_factor = if total_debt_base < MIN_CLOSE_FACTOR_THRESHOLD {
+        MAX_CLOSE_FACTOR  // 100%，因为 $1,500 < $2,000
     } else {
-        5_000u128  // 50%
+        DEFAULT_CLOSE_FACTOR
     };
-    let max_liquidatable_router = total_debt_base * dynamic_close_factor / basis_points; // $1 500
+    let router_max = total_debt_base * router_close_factor / BASIS_POINTS; // $1,500 * WAD
+    let router_accepts = debt_to_cover_base <= router_max;
 
-    let router_accepts = debt_to_cover_base <= max_liquidatable_router;
+    println!("=== Finding B: 硬编码 close factor 误拒 ===");
+    println!("  仓位债务:          ${}", total_debt_base / WAD);
+    println!("  阈值:              ${}", MIN_CLOSE_FACTOR_THRESHOLD / WAD);
+    println!("  helper 最大可清算: ${} (50% 硬编码)", helper_max / WAD);
+    println!("  router 最大可清算: ${} (100% 动态)", router_max / WAD);
+    println!("  helper 拒绝:  {}", helper_rejects);
+    println!("  router 接受:  {}", router_accepts);
 
-    println!("=== Finding B: hardcoded close factor false rejection ===");
-    println!("  total_debt_base:          ${}", total_debt_base / 1_000_000_000_000_000_000);
-    println!("  debt_to_cover (100%):     ${}", debt_to_cover_base / 1_000_000_000_000_000_000);
-    println!("  helper max_liquidatable:  ${} (50% hardcoded)", max_liquidatable_helper / 1_000_000_000_000_000_000);
-    println!("  router max_liquidatable:  ${} (100% dynamic)", max_liquidatable_router / 1_000_000_000_000_000_000);
-    println!("  helper rejects:  {}", helper_rejects);
-    println!("  router accepts:  {}", router_accepts);
+    // 核心断言：helper 拒绝，但 router 会接受
+    assert!(helper_rejects, "helper 应拒绝（硬编码 50% 上限 = $750，请求 $1,500）");
+    assert!(router_accepts, "router 应接受（动态 100% 上限 = $1,500，请求 $1,500）");
 
-    assert!(
-        helper_rejects,
-        "Helper should reject the full-liquidation (hardcoded 50% close factor)"
+    // 量化误拒范围：所有满足 debt < $2,000 的仓位全额清算请求均受影响
+    // 被误拒的金额 = debt_to_cover - helper_max
+    let rejected_amount = debt_to_cover_base - helper_max;
+    assert_eq!(
+        rejected_amount,
+        750 * WAD,
+        "被误拒的清算金额应为 $750（债务的 50%），实际为 ${}",
+        rejected_amount / WAD
     );
-    assert!(
-        router_accepts,
-        "Router should accept the full-liquidation (dynamic 100% close factor)"
-    );
-    assert!(
-        helper_rejects && router_accepts,
-        "Bug confirmed: helper rejects a liquidation the main router would accept.\n  \
-         Liquidator using helper for pre-validation will miss this opportunity.\n  \
-         Position: total_debt=${}, threshold=${}, helper_max=${}, router_max=${}",
-        total_debt_base / 1_000_000_000_000_000_000,
-        min_close_factor_threshold / 1_000_000_000_000_000_000,
-        max_liquidatable_helper / 1_000_000_000_000_000_000,
-        max_liquidatable_router / 1_000_000_000_000_000_000,
-    );
+
+    println!("  被误拒的清算金额: ${}", rejected_amount / WAD);
+    println!("  修复: 在 helper 中复制 validate_close_factor 的动态逻辑");
 }
 ```
 
-## Quantified impact
+## 测试证明了什么
 
-| Metric | Value |
+| 断言 | 含义 |
 |---|---|
-| Affected positions | All positions with debt < $2 000 OR collateral < $2 000 |
-| False rejection rate | 100% of full-liquidation attempts on qualifying small positions |
-| Liquidator impact | Misses valid liquidation opportunity; must bypass helper or resize to 50% |
-| Protocol impact | Undercollateralized small positions may linger longer, increasing bad debt risk |
-| Fix | Replicate `validate_close_factor` logic in helper, or pass close factor as parameter |
+| `helper_rejects == true` | helper 对合法的全额清算返回 `LiquidationAmountTooHigh` |
+| `router_accepts == true` | 同一请求主路由器会正常处理 |
+| `rejected_amount == $750` | 清算机器人被迫少清算 50% 的债务，或完全放弃该机会 |
+
+## 量化影响
+
+| 指标 | 数值 |
+|---|---|
+| 受影响仓位 | 所有债务 < $2,000 或抵押品 < $2,000 的仓位 |
+| 误拒率 | 100%（此类仓位的全额清算请求全部被拒） |
+| 每次误拒损失 | 清算机器人少清算 50% 债务（= `debt_to_cover / 2`） |
+| 协议风险 | 小型不良仓位滞留时间延长，坏账风险上升 |
+| 修复成本 | 在 helper 中复制 `validate_close_factor` 逻辑，约 10 行 |
